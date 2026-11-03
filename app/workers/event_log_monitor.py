@@ -48,6 +48,7 @@ class EventLogMonitorWorker(QThread):
 
         while self._running:
             try:
+                # is_channel_enabled có cache — không gọi wevtutil liên tục
                 if not is_channel_enabled():
                     if not self._warned_disabled:
                         self._warned_disabled = True
@@ -56,7 +57,8 @@ class EventLogMonitorWorker(QThread):
                             "Log PrintService/Operational đang TẮT. "
                             "Bấm «Bật Event Log in» (cần Admin)."
                         )
-                    self.msleep(int(self._poll_interval * 1000))
+                    # Khi tắt log: chờ lâu hơn, tránh spam kiểm tra
+                    self.msleep(5000)
                     continue
 
                 self._warned_disabled = False

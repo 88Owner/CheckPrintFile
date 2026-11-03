@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import subprocess
+import threading
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
+
 CHANNEL = "Microsoft-Windows-PrintService/Operational"
 EVENT_ID_PRINTED = 307
 
@@ -15,6 +18,26 @@ _NS = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
 # Policy ghi tên tài liệu vào event (nếu không bật → Param2 = "Print Document")
 _JOB_NAME_REG = r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers"
 _JOB_NAME_VALUE = "AllowJobNameInEvents"
+
+# Cache trạng thái channel — tránh gọi wevtutil liên tục (gây nháy cửa sổ console)
+_channel_lock = threading.Lock()
+_channel_cached: bool | None = None
+_channel_checked_at: float = 0.0
+_CHANNEL_CACHE_TTL = 30.0  # giây
+
+
+def _subprocess_kwargs() -> dict:
+    """Chạy process ẩn, không nháy cửa sổ CMD trên Windows."""
+    kwargs: dict = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return kwargs
+
 
 
 @dataclass(frozen=True)
@@ -38,7 +61,36 @@ class PrintServiceEvent307:
         return name in {"", "print document", "document"}
 
 
-def is_channel_enabled() -> bool:
+def invalidate_channel_cache() -> None:
+    global _channel_cached, _channel_checked_at
+    with _channel_lock:
+        _channel_cached = None
+        _channel_checked_at = 0.0
+
+
+def is_channel_enabled(*, force: bool = False) -> bool:
+    """
+    Kiểm tra PrintService/Operational đã bật chưa.
+    Có cache 30s để worker không gọi wevtutil mỗi vài giây (tránh nháy console).
+    """
+    global _channel_cached, _channel_checked_at
+    now = time.monotonic()
+    with _channel_lock:
+        if (
+            not force
+            and _channel_cached is not None
+            and (now - _channel_checked_at) < _CHANNEL_CACHE_TTL
+        ):
+            return _channel_cached
+
+    enabled = _read_channel_enabled()
+    with _channel_lock:
+        _channel_cached = enabled
+        _channel_checked_at = time.monotonic()
+    return enabled
+
+
+def _read_channel_enabled() -> bool:
     code, out = _wevtutil("gl", CHANNEL)
     if code != 0:
         return False
@@ -53,7 +105,6 @@ def enable_channel_elevated() -> tuple[bool, str]:
     Bật log Operational + cho phép ghi tên job vào event.
     Dùng UAC (runas). Trả về (ok, message).
     """
-    # wevtutil cần admin
     ps = (
         f'wevtutil sl "{CHANNEL}" /e:true; '
         f'New-Item -Path "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Printers" '
@@ -62,18 +113,20 @@ def enable_channel_elevated() -> tuple[bool, str]:
         f'-Name "{_JOB_NAME_VALUE}" -Value 1 -Type DWord -Force'
     )
     try:
-        # ShellExecute runas qua PowerShell Start-Process -Verb RunAs
         cmd = [
             "powershell",
             "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
             "-Command",
             (
-                "Start-Process powershell -Verb RunAs -Wait -ArgumentList "
-                f"'-NoProfile -ExecutionPolicy Bypass -Command \"{ps}\"'"
+                "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList "
+                f"'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"{ps}\"'"
             ),
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        if is_channel_enabled():
+        proc = subprocess.run(cmd, **_subprocess_kwargs())
+        invalidate_channel_cache()
+        if is_channel_enabled(force=True):
             return True, "Đã bật PrintService/Operational và Allow job name in event logs."
         detail = (proc.stderr or proc.stdout or "").strip()
         return False, detail or "Chưa bật được log (có thể đã hủy UAC)."
@@ -82,13 +135,7 @@ def enable_channel_elevated() -> tuple[bool, str]:
 
 
 def _wevtutil(*args: str) -> tuple[int, str]:
-    proc = subprocess.run(
-        ["wevtutil", *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    proc = subprocess.run(["wevtutil", *args], **_subprocess_kwargs())
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
@@ -220,10 +267,14 @@ def iter_event_307(
 
 def watch_new_events(last_record_id: int, *, limit: int = 100) -> list[PrintServiceEvent307]:
     """Lấy các Event 307 mới hơn last_record_id."""
-    if not is_channel_enabled():
+    # Dùng cache; không force để tránh gọi wevtutil mỗi vòng poll
+    if not is_channel_enabled(force=False):
         return []
     try:
-        events = iter_event_307(max_events=limit, after_record_id=last_record_id if last_record_id > 0 else None)
+        events = iter_event_307(
+            max_events=limit,
+            after_record_id=last_record_id if last_record_id > 0 else None,
+        )
     except RuntimeError:
         return []
     if last_record_id <= 0:
