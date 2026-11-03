@@ -1,14 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec cho PDF Print Checker."""
+"""PyInstaller spec — EXE có icon, chạy offline."""
 
+from pathlib import Path
+
+from PyInstaller.building.api import COLLECT, EXE, PYZ
+from PyInstaller.building.build_main import Analysis
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+ROOT = Path(SPECPATH)
+ICON = ROOT / "assets" / "app.ico"
+
+datas = [(str(ROOT / "assets" / "app.ico"), "assets"), (str(ROOT / "assets" / "app.png"), "assets")]
 binaries = []
 hiddenimports = [
     "win32print",
     "win32api",
     "win32con",
+    "win32evtlog",
     "pywintypes",
     "pythoncom",
     "watchdog.observers.winapi",
@@ -21,7 +29,7 @@ hiddenimports += tmp_ret[2]
 
 a = Analysis(
     ["main.py"],
-    pathex=[],
+    pathex=[str(ROOT)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -50,6 +58,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(ICON) if ICON.exists() else None,
 )
 coll = COLLECT(
     exe,
